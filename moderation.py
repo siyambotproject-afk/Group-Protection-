@@ -175,14 +175,30 @@ def moderate_urls(
     """
     Check all URLs in *text* against blocklists/allowlists.
 
+    DEFAULT POLICY (closed/strict): any URL from an unknown domain is BLOCKED.
+    Only explicitly allowlisted domains (default or group) are permitted.
+
     Precedence (highest → lowest):
       1. DEFAULT blocklist  — always blocks; group allowlist cannot override.
       2. GROUP blocklist    — /blockdomain entries.
-      3. Confusable check   — look-alike domains against combined blocklist.
-      4. DEFAULT allowlist  — known-safe domains.
-      5. GROUP allowlist    — custom allowed domains (only if not in default blocklist).
-      6. URL shorteners     — logged but allowed.
-      7. Unknown domains    — allowed (open policy).
+      3. DEFAULT allowlist  — known-safe domains (checked BEFORE confusable to
+                              prevent false positives, e.g. google.com ≠ g00gle.com).
+      4. GROUP allowlist    — custom allowed domains (only if not in default blocklist).
+      5. Confusable check   — look-alike domains against combined blocklist.
+                              Runs AFTER allowlists so legitimate safe domains
+                              are not blocked by their blocklisted look-alikes.
+      6. URL shorteners     — blocked (destination is unverifiable; fail closed).
+      7. Unknown domains    — BLOCKED (default closed policy).
+
+    BUG-A FIX: Rule 7 changed from ALLOW to BLOCK.
+      Root cause of the reported issue: any URL not in a known list was silently
+      allowed (open policy). The intended policy is the opposite — only explicitly
+      allowlisted domains pass; everything else is deleted.
+
+    BUG-B FIX: Allowlist check (Rules 3 & 4) moved before confusable check (Rule 5).
+      Previously Rule 3 (confusable) ran before Rules 4 & 5 (allowlists), causing
+      legitimate allowlisted domains (e.g. google.com) to be blocked because a
+      look-alike was in the blocklist (g00gle.com deconfuses to the same string).
     """
     urls = extract_urls(text)
     if not urls:
@@ -198,7 +214,7 @@ def moderate_urls(
 
         root = _root_domain(domain)
 
-        # Rule 1: Default blocklist — always wins
+        # Rule 1: Default blocklist — always wins, group allowlist cannot override
         if domain in _DEFAULT_BLOCKLIST or root in _DEFAULT_BLOCKLIST:
             return ModerationResult(
                 Verdict.BLOCK,
@@ -214,7 +230,14 @@ def moderate_urls(
                 details={"domain": domain, "list": "group_block"},
             )
 
-        # Rule 3: Confusable-character check against combined blocklist
+        # BUG-B FIX — Rules 3 & 4: Allowlists checked BEFORE confusable check.
+        # This prevents google.com being blocked because g00gle.com is in the blocklist.
+        if (domain in _DEFAULT_ALLOWLIST or root in _DEFAULT_ALLOWLIST
+                or domain in group_allowed_set or root in group_allowed_set):
+            continue
+
+        # Rule 5 (was 3): Confusable-character check against combined blocklist.
+        # Only reached for domains not already in an allowlist.
         combined_blocked = _DEFAULT_BLOCKLIST | group_blocked_set
         deconfused = _deconfuse(domain)
         if any(_deconfuse(b) == deconfused for b in combined_blocked):
@@ -224,17 +247,24 @@ def moderate_urls(
                 details={"domain": domain, "list": "confusable"},
             )
 
-        # Rules 4 & 5: Allowlists
-        if (domain in _DEFAULT_ALLOWLIST or root in _DEFAULT_ALLOWLIST
-                or domain in group_allowed_set or root in group_allowed_set):
-            continue
-
-        # Rule 6: URL shorteners
+        # Rule 6: URL shorteners — blocked (destination is unverifiable; fail closed)
         if domain in _URL_SHORTENERS:
-            logger.info("URL shortener in message (destination unverifiable): %s", domain)
-            continue
+            logger.info("URL shortener blocked (destination unverifiable): %s", domain)
+            return ModerationResult(
+                Verdict.BLOCK,
+                reason=f"URL shortener লিংক অনুমোদিত নয় (গন্তব্য যাচাইযোগ্য নয়): {domain}",
+                details={"domain": domain, "list": "shortener"},
+            )
 
-        # Rule 7: Unknown — allow
+        # BUG-A FIX — Rule 7: Unknown domain → BLOCK (closed/strict default policy).
+        # Previously this returned ALLOW (open policy), causing the reported bug where
+        # ordinary members' links (e.g. https://example.com) were never deleted.
+        logger.info("Unknown domain blocked by default closed policy: %s", domain)
+        return ModerationResult(
+            Verdict.BLOCK,
+            reason=f"অজানা লিংক — গ্রুপ নীতি অনুযায়ী অনুমোদিত নয়: {domain}",
+            details={"domain": domain, "list": "unknown_blocked"},
+        )
 
     return ALLOW
 
@@ -678,4 +708,3 @@ async def moderate_gif_bytes(gif_bytes: bytes) -> ModerationResult:
             Verdict.DEGRADED,
             reason=f"GIF decode/inspection failed — not treated as safe ({type(exc).__name__}).",
         )
-

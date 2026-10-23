@@ -1,0 +1,48 @@
+# render.yaml — Render deployment configuration
+#
+# ⚠️  FREE TIER LIMITATIONS (read before deploying):
+#   - Render Free web services spin down after 15 minutes of inactivity.
+#     On the next incoming Telegram update the service takes ~30–60 seconds
+#     to wake up, during which messages are NOT moderated.
+#   - Free services have a 750-hour/month usage cap across all free services
+#     on your account.
+#   - For always-on moderation use Render Starter ($7/mo) or run the bot
+#     on a VPS (e.g. Oracle Cloud free tier always-on VM).
+#
+# ⚠️  CREDENTIAL SECURITY:
+#   - Set all "sync: false" variables in the Render dashboard — never
+#     commit real values to this file or to any source-control repository.
+#   - FIREBASE_SERVICE_ACCOUNT_JSON must be pasted as a single-line JSON
+#     string with no newlines.
+
+services:
+  - type: web
+    name: group-protection-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free          # Change to "starter" for always-on protection
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false     # Set in Render dashboard
+      - key: FIREBASE_DATABASE_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false     # Paste full JSON as one line, no newlines
+      - key: SIGHTENGINE_API_USER
+        sync: false     # Optional — media moderation degrades without this
+      - key: SIGHTENGINE_API_SECRET
+        sync: false
+      - key: MEDIA_FALLBACK_POLICY
+        value: "block"  # Strict Mode: block media that could not be inspected
+      - key: ADMIN_BYPASS_DELETE_ONLY
+        value: "true"   # true = delete-only for admins; false = full warnings
+      - key: DEFAULT_MUTE_MINUTES
+        value: "1440"   # 24 hours
+      - key: MAX_WARNINGS
+        value: "3"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: PORT
+        value: "8000"

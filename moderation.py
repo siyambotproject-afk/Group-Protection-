@@ -32,6 +32,7 @@ instead returns DEGRADED so the caller can apply the fallback policy.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import unicodedata
@@ -318,11 +319,13 @@ def _deobfuscate_text(text: str) -> str:
 
 def moderate_text(text: str) -> ModerationResult:
     """
-    Check message text for prohibited content.
+    Regex-only synchronous text check.
 
-    Tier 1 (ALWAYS_BLOCK) fires unconditionally — safe-context words like
-    "doctor" or "study" cannot override these.
-    Tier 2 (CONTEXT_BLOCK) fires only when no educational/medical context exists.
+    Tier 1 (ALWAYS_BLOCK): স্পষ্ট গালি/অশ্লীল — সবসময় block।
+    Tier 2 (CONTEXT_BLOCK): context ছাড়া block।
+
+    এই ফাংশন শুধু regex চেক করে।
+    Gemini AI চেকের জন্য moderate_text_async() ব্যবহার করুন।
     """
     if not text:
         return ALLOW
@@ -349,6 +352,148 @@ def moderate_text(text: str) -> ModerationResult:
                 reason="অনুপযুক্ত বা নিষিদ্ধ টেক্সট",
                 details={"matched": match.group(), "tier": "context_block"},
             )
+
+    return ALLOW
+
+
+# ──────────────────────────────────────────────
+# Gemini AI Text Moderation
+# ──────────────────────────────────────────────
+
+_GEMINI_PROMPT_TEMPLATE = """\
+তুমি একটি Telegram গ্রুপের content moderator। নিচের মেসেজটি বিশ্লেষণ করো।
+
+মেসেজ:
+\"\"\"
+{text}
+\"\"\"
+
+এই মেসেজটি কি নিচের যেকোনো একটি বিভাগে পড়ে?
+1. যৌন বা অশ্লীল কথা (সরাসরি বা ইঙ্গিতপূর্ণ)
+2. যৌন উত্তেজনা বা flirting (যেমন "তুমি হট", "সেক্স করবা")
+3. গালিগালাজ বা অপমানজনক ভাষা
+4. হয়রানি বা ভয় দেখানো
+
+শুধুমাত্র নিচের JSON format-এ উত্তর দাও, অন্য কিছু লিখবে না:
+{{"is_violation": true/false, "category": "sexual/abusive/harassment/none", "reason": "সংক্ষিপ্ত কারণ বাংলায়", "score": 0.0}}
+
+score হবে 0.0 থেকে 1.0 এর মধ্যে (1.0 = নিশ্চিতভাবে লঙ্ঘন)।
+সাধারণ কথাবার্তা, প্রশ্ন, বা নিরীহ মেসেজের জন্য is_violation: false দাও।
+"""
+
+_GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+async def _call_gemini(text: str) -> Optional[dict]:
+    """
+    Gemini API-তে POST করে JSON response ফেরত দেয়।
+    ব্যর্থ হলে None ফেরত দেয়।
+    """
+    url = _GEMINI_API_URL.format(model=config.GEMINI_MODEL)
+    prompt = _GEMINI_PROMPT_TEMPLATE.format(text=text[:1500])  # max 1500 char
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,       # কম temperature = consistent output
+            "maxOutputTokens": 150,   # শুধু JSON দরকার
+        },
+    }
+
+    params = {"key": config.GEMINI_API_KEY}
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as session:
+            async with session.post(url, json=payload, params=params) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Gemini API HTTP %s: %s", resp.status, body[:200])
+                    return None
+                data = await resp.json()
+
+        # Gemini response থেকে text বের করা
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logger.warning("Gemini: কোনো candidate নেই")
+            return None
+
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            return None
+
+        raw_text = parts[0].get("text", "").strip()
+
+        # JSON parse — markdown fence সরিয়ে
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        return json.loads(raw_text)
+
+    except asyncio.TimeoutError:
+        logger.warning("Gemini: request timeout (>10s)")
+        return None
+    except json.JSONDecodeError as exc:
+        logger.warning("Gemini: JSON parse error: %s", exc)
+        return None
+    except Exception as exc:
+        logger.error("Gemini: unexpected error: %s", exc)
+        return None
+
+
+async def moderate_text_async(text: str) -> ModerationResult:
+    """
+    Smart hybrid text moderation:
+
+    ধাপ ১ — Regex (sync, fast):
+        স্পষ্ট গালি/অশ্লীল শব্দ থাকলে সাথে সাথে BLOCK।
+        Gemini API call হয় না — cost শূন্য।
+
+    ধাপ ২ — Gemini AI (async, smart):
+        Regex কিছু না ধরলে Gemini দিয়ে চেক।
+        "তুমি হট", "সেক্স করবা", যেভাবেই লিখুক — context বুঝবে।
+        Gemini unavailable বা error হলে ALLOW (fail open — text-এর জন্য safe)।
+
+    bot.py-তে message_handler()-এ এই ফাংশন ব্যবহার করুন।
+    """
+    if not text:
+        return ALLOW
+
+    # ── ধাপ ১: Regex চেক ──────────────────────────────────────────────────
+    regex_result = moderate_text(text)
+    if regex_result.is_violation:
+        return regex_result
+
+    # ── ধাপ ২: Gemini AI চেক ─────────────────────────────────────────────
+    if not config.GEMINI_AVAILABLE:
+        return ALLOW  # Gemini না থাকলে regex result-ই চূড়ান্ত
+
+    # খুব ছোট মেসেজ (১-২ শব্দ) Gemini-তে না পাঠানো — false positive এড়াতে
+    if len(text.strip()) < 5:
+        return ALLOW
+
+    gemini_data = await _call_gemini(text)
+
+    if gemini_data is None:
+        # API error — fail open (text moderate না হওয়া media-র চেয়ে কম ঝুঁকির)
+        logger.info("Gemini unavailable — text '%s...' allowed by default", text[:30])
+        return ALLOW
+
+    is_violation = gemini_data.get("is_violation", False)
+    score = float(gemini_data.get("score", 0.0))
+    category = gemini_data.get("category", "none")
+    reason = gemini_data.get("reason", "অনুপযুক্ত কন্টেন্ট")
+
+    if is_violation and score >= config.GEMINI_BLOCK_THRESHOLD:
+        logger.info(
+            "Gemini blocked text (score=%.2f, category=%s): '%s...'",
+            score, category, text[:40],
+        )
+        return ModerationResult(
+            Verdict.BLOCK,
+            reason=f"AI মডারেশন: {reason}",
+            details={"gemini_score": score, "category": category, "tier": "gemini"},
+        )
 
     return ALLOW
 
@@ -708,3 +853,4 @@ async def moderate_gif_bytes(gif_bytes: bytes) -> ModerationResult:
             Verdict.DEGRADED,
             reason=f"GIF decode/inspection failed — not treated as safe ({type(exc).__name__}).",
         )
+

@@ -245,16 +245,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     group_id = chat.id
     user_id = user.id
     message_id = msg.message_id
-    # Make it obvious in Render logs whether Telegram is delivering group messages.
-    # This is intentionally INFO-level so it works with the default LOG_LEVEL.
-    logger.info(
-        "Moderation received group message: chat_id=%s message_id=%s user_id=%s has_text=%s has_media=%s",
-        group_id,
-        message_id,
-        user_id,
-        bool(msg.text or msg.caption),
-        bool(msg.photo or msg.video or msg.animation or msg.sticker or msg.document),
-    )
 
     # Read DB values with explicit failure detection. Legacy wrappers intentionally
     # return defaults on errors, so the moderation path uses strict readers.
@@ -285,9 +275,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text_parts.append(msg.caption)
     full_text = " ".join(text_parts)
 
-    # — Text moderation
+    # — Text moderation (regex + Gemini AI)
     if full_text:
-        result = moderation.moderate_text(full_text)
+        result = await moderation.moderate_text_async(full_text)
         if result.is_violation:
             await handler.handle(
                 group_id, user_id, message_id, _mention(user), result.reason
@@ -684,18 +674,6 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     logger.info("Bot starting — polling...")
-    # Python 3.14 no longer creates a current event loop implicitly. Some
-    # python-telegram-bot versions call get_event_loop() inside run_polling(),
-    # which otherwise crashes before polling starts. Create one explicitly when
-    # the process has none; on older Python versions this leaves the existing
-    # loop untouched.
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        logger.info("Created an asyncio event loop for polling startup.")
-
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

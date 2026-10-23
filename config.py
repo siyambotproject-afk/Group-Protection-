@@ -99,6 +99,21 @@ DEFAULT_MUTE_MINUTES: int = int(os.environ.get("DEFAULT_MUTE_MINUTES", str(24 * 
 DEDUP_TTL_SECONDS: int = int(os.environ.get("DEDUP_TTL_SECONDS", "300"))
 
 # ──────────────────────────────────────────────
+# Gemini AI Text Moderation
+# ──────────────────────────────────────────────
+GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_AVAILABLE: bool = bool(GEMINI_API_KEY)
+
+# Gemini model to use for text moderation (flash = fast + free tier)
+GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+# Gemini moderation threshold — 0.0 to 1.0
+# Score এর উপরে গেলে BLOCK হবে
+GEMINI_BLOCK_THRESHOLD: float = float(
+    os.environ.get("GEMINI_BLOCK_THRESHOLD", "0.7")
+)
+
+# ──────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -136,6 +151,13 @@ def validate() -> list[str]:
             "(SIGHTENGINE_API_USER / SIGHTENGINE_API_SECRET). "
             "Image and video moderation will run in DEGRADED MODE — "
             "media will not be inspected."
+        )
+
+    if not GEMINI_AVAILABLE:
+        logger.warning(
+            "GEMINI_API_KEY সেট করা নেই — "
+            "AI text moderation বন্ধ থাকবে। "
+            "শুধু regex-based text moderation চলবে।"
         )
 
     if not (0.0 <= SIGHTENGINE_NUDITY_THRESHOLD <= 1.0):

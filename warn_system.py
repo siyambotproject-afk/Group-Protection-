@@ -24,6 +24,7 @@ KEY DESIGN DECISIONS (see AUDIT-REPORT.md for full rationale):
 
 from __future__ import annotations
 
+import html
 import logging
 import time
 from typing import Callable, Awaitable
@@ -39,19 +40,20 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 
 def warning_message(count: int, max_warnings: int, reason: str) -> str:
+    """HTML parse mode-এর জন্য। reason escape করা হয়।"""
     return (
-        f"⚠️ *সতর্কবার্তা {count}/{max_warnings}*\n"
-        f"কারণ: {reason}\n"
+        f"⚠️ <b>সতর্কবার্তা {count}/{max_warnings}</b>\n"
+        f"কারণ: {html.escape(reason)}\n"
         "দয়া করে গ্রুপের নিয়ম মেনে চলুন।"
     )
 
 
 def mute_message(user_mention: str, minutes: int, reason: str) -> str:
     hours = minutes // 60
-    duration_text = f"{hours} ঘণ্টা" if hours >= 1 else f"{minutes} মিনিট"
+    duration_text = f"{hours} ঘণ্টার" if hours >= 1 else f"{minutes} মিনিটের"
     return (
-        f"🔇 {user_mention} *{duration_text}ের জন্য নিষিদ্ধ (muted)*\n"
-        f"কারণ: {reason}\n"
+        f"🔇 {user_mention} <b>{duration_text} জন্য নিষিদ্ধ (muted)</b>\n"
+        f"কারণ: {html.escape(reason)}\n"
         "সতর্কতা সীমা অতিক্রমের পর স্বয়ংক্রিয়ভাবে mute করা হয়েছে।"
     )
 
@@ -70,6 +72,9 @@ class ViolationHandler:
     mute_user_fn      : async (chat_id, user_id, until_ts) → bool
     send_message_fn   : async (chat_id, text, parse_mode) → None
     is_admin_fn       : async (chat_id, user_id) → bool
+
+    সব message HTML parse mode-এ যায়; user_mention অবশ্যই HTML mention
+    (যেমন user.mention_html()) হতে হবে।
     """
 
     def __init__(
@@ -91,8 +96,19 @@ class ViolationHandler:
         message_id: int,
         user_mention: str,
         reason: str,
-    ) -> None:
+        *,
+        check_dedup: bool = True,
+        delete_message: bool = True,
+    ) -> dict:
         """
+        check_dedup    : False দিলে ধাপ ১ বাদ যায়। bot.py-এর handle_message নিজেই
+                         আগে mark_as_processed() করে, তাই সেখান থেকে False দিতে হয়
+                         (নইলে handler নিজেকেই duplicate ভেবে skip করবে)। /warn-এও
+                         False — কারণ reply করা মেসেজ আগেই processed হয়ে থাকতে পারে।
+        delete_message : False দিলে মেসেজ delete করা হয় না (caller আগেই করেছে)।
+
+        Returns the warning record (e.g. {"count": 2, ...}); {} if skipped/failed.
+
         Full violation pipeline — order is critical:
 
           1. Dedup check   — skip if already fully processed.
@@ -116,9 +132,9 @@ class ViolationHandler:
         """
 
         # ── 1. Dedup check ────────────────────────────────────────────────
-        if database.is_already_processed(group_id, message_id):
+        if check_dedup and database.is_already_processed(group_id, message_id):
             logger.debug("Duplicate event for msg %s in group %s — skipped.", message_id, group_id)
-            return
+            return {}
 
         # ── 2. Load group settings ────────────────────────────────────────
         settings = database.get_settings(group_id)
@@ -139,19 +155,21 @@ class ViolationHandler:
                 "Admin %s in group %s violated policy — deleting message only (admin_bypass_delete_only=True).",
                 user_id, group_id,
             )
-            await self._delete(group_id, message_id)
+            if delete_message:
+                await self._delete(group_id, message_id)
             # Mark processed so we don't retry this admin message either
             database.mark_as_processed(group_id, message_id)
-            return
+            return {}
 
         # ── 4. Delete the offending message ──────────────────────────────
-        deleted = await self._delete(group_id, message_id)
-        if not deleted:
-            logger.warning(
-                "Could not delete msg %s in group %s — bot may lack Delete Messages permission.",
-                message_id, group_id,
-            )
-            # Continue: still issue the warning even if deletion failed.
+        if delete_message:
+            deleted = await self._delete(group_id, message_id)
+            if not deleted:
+                logger.warning(
+                    "Could not delete msg %s in group %s — bot may lack Delete Messages permission.",
+                    message_id, group_id,
+                )
+                # Continue: still issue the warning even if deletion failed.
 
         # ── 5. Increment warning (atomic Firebase transaction) ────────────
         try:
@@ -161,10 +179,10 @@ class ViolationHandler:
             await self._send(
                 group_id,
                 "⚠️ ডেটাবেস ত্রুটি — সতর্কতা সংরক্ষণ করা যায়নি। অ্যাডমিনকে জানান।",
-                "Markdown",
+                "HTML",
             )
             # Do NOT mark as processed — allow retry when DB recovers.
-            return
+            return {}
 
         count: int = record.get("count", 1)
 
@@ -174,7 +192,7 @@ class ViolationHandler:
         # ── 7. Notify ─────────────────────────────────────────────────────
         if count < max_warnings:
             msg = warning_message(count, max_warnings, reason)
-            await self._send(group_id, f"{user_mention}\n{msg}", "Markdown")
+            await self._send(group_id, f"{user_mention}\n{msg}", "HTML")
 
         else:
             # Threshold reached — attempt mute
@@ -195,7 +213,7 @@ class ViolationHandler:
                 await self._send(
                     group_id,
                     f"{user_mention}\n{msg}\n\n{mute_msg}",
-                    "Markdown",
+                    "HTML",
                 )
             else:
                 logger.error(
@@ -208,5 +226,7 @@ class ViolationHandler:
                     f"{user_mention}\n{msg}\n"
                     "⚠️ Bot-এর Restrict Members permission নেই — mute করা সম্ভব হয়নি। "
                     "Bot-কে Admin করে 'Restrict Members' permission দিন।",
-                    "Markdown",
+                    "HTML",
                 )
+
+        return record

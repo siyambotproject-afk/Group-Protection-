@@ -99,6 +99,13 @@ DEFAULT_MUTE_MINUTES: int = int(os.environ.get("DEFAULT_MUTE_MINUTES", str(24 * 
 DEDUP_TTL_SECONDS: int = int(os.environ.get("DEDUP_TTL_SECONDS", "300"))
 
 # ──────────────────────────────────────────────
+# Bot Owner & System Config
+# ──────────────────────────────────────────────
+BOT_OWNER_ID: int = int(os.environ.get("BOT_OWNER_ID", "0"))
+ANTI_RAID_THRESHOLD: int = int(os.environ.get("ANTI_RAID_THRESHOLD", "10"))
+WARN_EXPIRE_DAYS: int = int(os.environ.get("WARN_EXPIRE_DAYS", "7"))
+
+# ──────────────────────────────────────────────
 # Gemini AI Text Moderation
 # ──────────────────────────────────────────────
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
@@ -112,6 +119,20 @@ GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_BLOCK_THRESHOLD: float = float(
     os.environ.get("GEMINI_BLOCK_THRESHOLD", "0.7")
 )
+
+# ──────────────────────────────────────────────
+# Groq AI (Fallback #1) — groq.com থেকে বিনামূল্যে
+# ──────────────────────────────────────────────
+GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
+GROQ_AVAILABLE: bool = bool(GROQ_API_KEY)
+GROQ_MODEL: str = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# ──────────────────────────────────────────────
+# Together AI (Fallback #2) — api.together.ai
+# ──────────────────────────────────────────────
+TOGETHER_API_KEY: str = os.environ.get("TOGETHER_API_KEY", "")
+TOGETHER_AVAILABLE: bool = bool(TOGETHER_API_KEY)
+TOGETHER_MODEL: str = os.environ.get("TOGETHER_MODEL", "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo")
 
 # ──────────────────────────────────────────────
 # Logging

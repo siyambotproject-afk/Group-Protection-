@@ -484,7 +484,8 @@ async def _call_gemini(text: str) -> Optional[dict]:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10)
         ) as session:
-            # 429/500/503 সাময়িক (যেমন "high demand") — ২ বার আবার চেষ্টা
+            # 500/503 সাময়িক (যেমন "high demand") — ২ বার আবার চেষ্টা।
+            # 429 = quota শেষ; তখন retry করলে শুধু আরও quota খরচ হয়, তাই সরাসরি fallback
             for attempt in range(3):
                 async with session.post(
                     url, json=payload, params={"key": config.GEMINI_API_KEY}
@@ -494,7 +495,7 @@ async def _call_gemini(text: str) -> Optional[dict]:
                         break
                     body = await resp.text()
                     logger.warning("Gemini HTTP %s: %s", resp.status, body[:150])
-                    if resp.status not in (429, 500, 503) or attempt == 2:
+                    if resp.status not in (500, 503) or attempt == 2:
                         return None
                 await asyncio.sleep(1.0 * (attempt + 1))
         if data is None:

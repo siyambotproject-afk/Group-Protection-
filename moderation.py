@@ -472,7 +472,12 @@ async def _call_gemini(text: str) -> Optional[dict]:
     prompt = _AI_MODERATION_PROMPT.format(text=text[:1500])
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 150},
+        "generationConfig": {
+            "temperature": 0.1,
+            # নতুন Gemini model "thinking" করতে token খরচ করে; 150 হলে JSON কেটে যায়
+            "maxOutputTokens": 1024,
+            "responseMimeType": "application/json",
+        },
     }
     try:
         async with aiohttp.ClientSession(
@@ -1072,4 +1077,3 @@ async def moderate_gif_bytes(gif_bytes: bytes) -> ModerationResult:
             Verdict.DEGRADED,
             reason=f"GIF decode/inspection failed — not treated as safe ({type(exc).__name__}).",
         )
-

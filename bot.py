@@ -400,9 +400,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user_is_vip:
         # VIP user — কোনো moderation নেই
         return
-    if user_is_trusted:
-        # Trusted user — spam/flood skip কিন্তু link/media moderation চলবে
-        user_is_admin = True  # spam/flood check-এ admin হিসেবে দেখাবে
+    # Trusted user — শুধু slowmode/spam/flood/auto-delete skip; text, link ও media
+    # moderation চলবে। (আগে user_is_admin = True করা হতো, ফলে trusted user-এর
+    # গালিও ধরা পড়ত না।)
+    skip_flood = user_is_admin or user_is_trusted
 
     try:
         settings = database.get_settings_strict(group_id)
@@ -414,7 +415,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Slow mode (/slowmode) ──
     slow_secs = settings.get("slowmode_seconds")
-    if isinstance(slow_secs, (int, float)) and slow_secs > 0 and not user_is_admin:
+    if isinstance(slow_secs, (int, float)) and slow_secs > 0 and not skip_flood:
         wait = security.slowmode.check(group_id, user.id, int(slow_secs), msg.media_group_id)
         if wait > 0:
             database.mark_as_processed(group_id, msg_id)
@@ -439,7 +440,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     violation_reason: str | None = None
 
     # ── Spam & Flood control ──
-    if not user_is_admin:
+    if not skip_flood:
         spam_result = spam_filter.check_spam_and_flood(
             group_id, user.id, full_text, features
         )
@@ -547,7 +548,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not violation_reason:
         database.mark_as_processed(group_id, msg_id)
         # Auto delete: চালু থাকলে সাধারণ মেসেজ নির্দিষ্ট সময় পরে delete হবে
-        if features.get("auto_delete", False) and not user_is_admin:
+        if features.get("auto_delete", False) and not skip_flood:
             auto_secs = settings.get("auto_delete_seconds")
             if isinstance(auto_secs, (int, float)) and auto_secs > 0:
                 scheduler.queue_autodelete(group_id, msg_id, int(auto_secs))

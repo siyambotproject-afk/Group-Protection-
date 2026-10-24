@@ -52,6 +52,9 @@ logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger(__name__)
+# httpx INFO log-এ প্রতিটা request URL ছাপে, যার ভেতরে BOT TOKEN থাকে — তাই চুপ করানো হলো
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ══════════════════════════════════════════════

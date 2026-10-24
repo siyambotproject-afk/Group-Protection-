@@ -297,3 +297,176 @@ def get_blocked_domains_strict(group_id: int) -> list[str]:
     if not isinstance(data, dict):
         raise RuntimeError("Invalid blocked-domain data")
     return [str(value) for value in data.values()]
+
+
+# ──────────────────────────────────────────────
+# Feature toggles
+# ──────────────────────────────────────────────
+
+def get_features(group_id: int) -> dict:
+    """গ্রুপের feature toggle state ফেরত দেয়।"""
+    from features import FEATURE_DEFAULTS
+    path = f"/groups/{group_id}/features"
+    try:
+        data = _ref(path).get() or {}
+        return {**FEATURE_DEFAULTS, **data}
+    except Exception as exc:
+        logger.error("get_features(%s) failed: %s", group_id, exc)
+        from features import FEATURE_DEFAULTS
+        return dict(FEATURE_DEFAULTS)
+
+
+def set_feature(group_id: int, feature: str, value: bool) -> None:
+    """একটি feature on/off করে।"""
+    _ref(f"/groups/{group_id}/features/{feature}").set(value)
+
+
+def is_feature_on(group_id: int, feature: str) -> bool:
+    """একটি feature চালু আছে কিনা দেখে।"""
+    features = get_features(group_id)
+    return bool(features.get(feature, True))
+
+
+# ──────────────────────────────────────────────
+# Welcome / Goodbye messages
+# ──────────────────────────────────────────────
+
+def get_welcome_message(group_id: int) -> str:
+    """গ্রুপের custom welcome message ফেরত দেয়।"""
+    try:
+        msg = _ref(f"/groups/{group_id}/welcome_message").get()
+        return msg or "👋 স্বাগতম {name}! আমাদের গ্রুপে আপনাকে স্বাগত জানাই।"
+    except Exception:
+        return "👋 স্বাগতম {name}! আমাদের গ্রুপে আপনাকে স্বাগত জানাই।"
+
+
+def set_welcome_message(group_id: int, message: str) -> None:
+    _ref(f"/groups/{group_id}/welcome_message").set(message)
+
+
+def get_goodbye_message(group_id: int) -> str:
+    try:
+        msg = _ref(f"/groups/{group_id}/goodbye_message").get()
+        return msg or "👋 {name} গ্রুপ ছেড়ে চলে গেছেন।"
+    except Exception:
+        return "👋 {name} গ্রুপ ছেড়ে চলে গেছেন।"
+
+
+def set_goodbye_message(group_id: int, message: str) -> None:
+    _ref(f"/groups/{group_id}/goodbye_message").set(message)
+
+
+# ──────────────────────────────────────────────
+# Rules
+# ──────────────────────────────────────────────
+
+def get_rules(group_id: int) -> str:
+    try:
+        rules = _ref(f"/groups/{group_id}/rules").get()
+        return rules or "এই গ্রুপের কোনো নিয়ম এখনো সেট করা হয়নি।"
+    except Exception:
+        return "এই গ্রুপের কোনো নিয়ম এখনো সেট করা হয়নি।"
+
+
+def set_rules(group_id: int, rules: str) -> None:
+    _ref(f"/groups/{group_id}/rules").set(rules)
+
+
+# ──────────────────────────────────────────────
+# Log channel
+# ──────────────────────────────────────────────
+
+def get_log_channel(group_id: int) -> Optional[int]:
+    try:
+        ch = _ref(f"/groups/{group_id}/log_channel").get()
+        return int(ch) if ch else None
+    except Exception:
+        return None
+
+
+def set_log_channel(group_id: int, channel_id: int) -> None:
+    _ref(f"/groups/{group_id}/log_channel").set(channel_id)
+
+
+# ──────────────────────────────────────────────
+# Mute / Ban
+# ──────────────────────────────────────────────
+
+def set_banned(group_id: int, user_id: int, banned: bool) -> None:
+    _ref(f"/groups/{group_id}/bans/{user_id}").set(banned)
+
+
+def is_banned(group_id: int, user_id: int) -> bool:
+    try:
+        return bool(_ref(f"/groups/{group_id}/bans/{user_id}").get())
+    except Exception:
+        return False
+
+
+# ──────────────────────────────────────────────
+# Anti-raid tracking
+# ──────────────────────────────────────────────
+
+def record_join(group_id: int) -> int:
+    """Join event রেকর্ড করে, শেষ ৬০ সেকেন্ডের join count ফেরত দেয়।"""
+    now = int(time.time())
+    path = f"/groups/{group_id}/joins"
+    try:
+        joins = _ref(path).get() or []
+        if not isinstance(joins, list):
+            joins = list(joins.values()) if isinstance(joins, dict) else []
+        # শুধু শেষ ৬০ সেকেন্ডের রাখো
+        joins = [t for t in joins if now - t < 60]
+        joins.append(now)
+        _ref(path).set(joins)
+        return len(joins)
+    except Exception as exc:
+        logger.warning("record_join failed: %s", exc)
+        return 0
+
+
+# ──────────────────────────────────────────────
+# Owner system
+# ──────────────────────────────────────────────
+
+def get_bot_stats() -> dict:
+    """Bot-এর সামগ্রিক stats ফেরত দেয়।"""
+    try:
+        groups = _ref("/groups").get() or {}
+        group_count = len(groups)
+        total_violations = 0
+        for gdata in groups.values():
+            if isinstance(gdata, dict):
+                warnings = gdata.get("warnings", {})
+                for udata in warnings.values():
+                    if isinstance(udata, dict):
+                        total_violations += len(udata.get("violations", []))
+        return {"groups": group_count, "violations": total_violations}
+    except Exception as exc:
+        logger.error("get_bot_stats failed: %s", exc)
+        return {"groups": 0, "violations": 0}
+
+
+def get_group_list() -> list[dict]:
+    """সব গ্রুপের তালিকা ফেরত দেয়।"""
+    try:
+        groups = _ref("/groups").get() or {}
+        result = []
+        for gid, gdata in groups.items():
+            if isinstance(gdata, dict):
+                result.append({"id": gid, "settings": gdata.get("settings", {})})
+        return result
+    except Exception:
+        return []
+
+
+def add_global_ban(user_id: int, reason: str = "") -> None:
+    """সব গ্রুপে এই user-কে ban করার জন্য global blacklist-এ যোগ করে।"""
+    _ref(f"/global_bans/{user_id}").set({"reason": reason, "ts": int(time.time())})
+
+
+def is_globally_banned(user_id: int) -> bool:
+    try:
+        return bool(_ref(f"/global_bans/{user_id}").get())
+    except Exception:
+        return False

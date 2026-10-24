@@ -505,7 +505,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Forward block ──
     if not violation_reason and features.get("forward_block", False) and not user_is_admin:
-        if msg.forward_date or msg.forward_from or msg.forward_from_chat:
+        if msg.forward_origin:  # PTB 21.x: forward_date/from/from_chat সরানো হয়েছে
             violation_reason = "↩️ ফরওয়ার্ড মেসেজ অনুমোদিত নয়"
 
     # ── Voice block ──

@@ -270,6 +270,58 @@ def moderate_urls(
     return ALLOW
 
 
+async def moderate_urls_async(
+    text: str,
+    group_blocked: list[str],
+    group_allowed: list[str],
+) -> ModerationResult:
+    """
+    ধাপ ৬ — Suspicious link checker।
+
+    টেক্সটে URL shortener (bit.ly ইত্যাদি) থাকলে আগে তার আসল গন্তব্য বের করা হয়,
+    তারপর শর্ট লিংকের জায়গায় আসল লিংক বসিয়ে moderate_urls()-এর সব নিয়ম প্রয়োগ হয়।
+
+      • গন্তব্য allowlist-এ থাকলে → অনুমোদিত
+      • গন্তব্য blocklist/অজানা/ছদ্মবেশী হলে → block (কারণে আসল গন্তব্য দেখানো হয়)
+      • গন্তব্য যাচাই করা না গেলে (timeout, অতিরিক্ত redirect, private IP) → আগের মতোই block (fail closed)
+
+    group/default allowlist-এ থাকা shortener-এ কিছু বদলায় না (আগের আচরণই থাকে)।
+    """
+    urls = extract_urls(text)
+    if not urls:
+        return ALLOW
+
+    group_allowed_set = {d.lower() for d in group_allowed}
+    resolved_text = text
+    replaced: dict[str, str] = {}
+
+    for raw in urls:
+        domain = normalise_url(raw)
+        if domain is None or domain not in _URL_SHORTENERS:
+            continue
+        root = _root_domain(domain)
+        if (domain in _DEFAULT_ALLOWLIST or root in _DEFAULT_ALLOWLIST
+                or domain in group_allowed_set or root in group_allowed_set):
+            continue
+        # নির্ভরতা চক্র এড়াতে এখানে import (security → moderation)
+        import security
+        destination = await security.resolve_url(raw)
+        if destination:
+            replaced[raw] = destination
+            resolved_text = resolved_text.replace(raw, destination)
+
+    result = moderate_urls(resolved_text, group_blocked, group_allowed)
+    if result.is_violation and replaced:
+        short, real = next(iter(replaced.items()))
+        real_domain = normalise_url(real) or real
+        return ModerationResult(
+            Verdict.BLOCK,
+            reason=f"শর্ট লিংকের আসল গন্তব্য অনুমোদিত নয় ({real_domain}) — {result.reason}",
+            details={**result.details, "short_url": short, "resolved_url": real},
+        )
+    return result
+
+
 # ──────────────────────────────────────────────
 # Text moderation
 # ──────────────────────────────────────────────

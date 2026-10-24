@@ -168,6 +168,44 @@ async def unmute_user(bot: Bot, chat_id: int, user_id: int) -> bool:
         return False
 
 
+def make_violation_handler(bot: Bot) -> warn_system.ViolationHandler:
+    """
+    warn_system.ViolationHandler-এর জন্য ৪টা async callback বানিয়ে দেয়।
+    (আগে সরাসরি ৭টা argument দেওয়া হতো, যা ক্লাসের __init__-এর সাথে মিলত না।)
+    """
+
+    async def _delete(chat_id: int, message_id: int) -> bool:
+        try:
+            await bot.delete_message(chat_id, message_id)
+            return True
+        except TelegramError as exc:
+            logger.debug("Delete failed (%s/%s): %s", chat_id, message_id, exc)
+            return False
+
+    async def _mute(chat_id: int, user_id: int, until_ts: float) -> bool:
+        try:
+            await bot.restrict_chat_member(
+                chat_id, user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=datetime.fromtimestamp(until_ts),
+            )
+            return True
+        except TelegramError as exc:
+            logger.warning("Mute failed for %s: %s", user_id, exc)
+            return False
+
+    async def _send(chat_id: int, text: str, parse_mode: str | None = None) -> None:
+        try:
+            await bot.send_message(chat_id, text, parse_mode=parse_mode)
+        except TelegramError as exc:
+            logger.warning("Send failed (%s): %s", chat_id, exc)
+
+    async def _is_admin(chat_id: int, user_id: int) -> bool:
+        return await is_admin(bot, chat_id, user_id)
+
+    return warn_system.ViolationHandler(_delete, _mute, _send, _is_admin)
+
+
 # ══════════════════════════════════════════════
 # Welcome / Goodbye
 # ══════════════════════════════════════════════
@@ -437,11 +475,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             need_auto_warn = spam_filter.record_suspicious_behavior(group_id, user.id)
             if need_auto_warn:
                 try:
-                    handler = warn_system.ViolationHandler(
-                        context.bot, group_id, user.id, user.full_name,
-                        msg_id, "বারবার সন্দেহজনক আচরণ (auto-warn)", settings,
+                    handler = make_violation_handler(context.bot)
+                    # মেসেজ আগেই delete + processed mark করা হয়েছে
+                    await handler.handle(
+                        group_id, user.id, msg_id, user.mention_html(),
+                        "বারবার সন্দেহজনক আচরণ (auto-warn)",
+                        check_dedup=False, delete_message=False,
                     )
-                    await handler.handle()
                 except Exception as exc:
                     logger.error("Auto-warn after pattern failed: %s", exc)
 
@@ -528,18 +568,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Warning দেওয়া
     try:
-        handler = warn_system.ViolationHandler(
-            context.bot, group_id, user.id, user.full_name,
-            msg_id, violation_reason, settings,
+        handler = make_violation_handler(context.bot)
+        # মেসেজ আগেই delete + processed mark করা হয়েছে
+        warn_data = await handler.handle(
+            group_id, user.id, msg_id, user.mention_html(), violation_reason,
+            check_dedup=False, delete_message=False,
         )
-        warn_data = await handler.handle()
 
         # Log channel-এ পাঠাও
         await send_log(
             context.bot, group_id,
             f"⚠️ <b>Violation</b>\n"
             f"👤 {user.mention_html()} (ID: {user.id})\n"
-            f"📝 কারণ: {violation_reason}\n"
+            f"📝 কারণ: {html.escape(violation_reason)}\n"
             f"⚠️ Warning: {warn_data.get('count', '?')}/{settings.get('max_warnings', 3)}",
         )
     except Exception as exc:
@@ -825,12 +866,13 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     reason = " ".join(context.args) if context.args else "অ্যাডমিন কর্তৃক সতর্কতা"
-    settings = database.get_settings(msg.chat.id)
-    handler = warn_system.ViolationHandler(
-        context.bot, msg.chat.id, target.id, target.full_name,
-        msg.reply_to_message.message_id, reason, settings,
+    handler = make_violation_handler(context.bot)
+    # reply করা মেসেজ আগেই "processed" হয়ে থাকতে পারে, তাই dedup বাদ
+    await handler.handle(
+        msg.chat.id, target.id, msg.reply_to_message.message_id,
+        target.mention_html(), reason,
+        check_dedup=False,
     )
-    await handler.handle()
 
 
 @group_only
@@ -984,10 +1026,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @admin_only
 async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await context.bot.set_chat_permissions(
-            update.effective_chat.id,
-            ChatPermissions(can_send_messages=False),
-        )
+        await scheduler.lock_group(context.bot, update.effective_chat.id)
         await update.message.reply_text("🔒 গ্রুপ লক করা হয়েছে। শুধু অ্যাডমিন মেসেজ দিতে পারবেন।")
     except TelegramError as exc:
         await update.message.reply_text(f"⚠️ Lock করতে ব্যর্থ: {exc}")
@@ -997,16 +1036,9 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @admin_only
 async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await context.bot.set_chat_permissions(
-            update.effective_chat.id,
-            ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-            ),
-        )
-        await update.message.reply_text("🔓 গ্রুপ আনলক করা হয়েছে।")
+        restored = await scheduler.unlock_group(context.bot, update.effective_chat.id)
+        note = " আগের permission ফিরিয়ে আনা হয়েছে।" if restored else ""
+        await update.message.reply_text(f"🔓 গ্রুপ আনলক করা হয়েছে।{note}")
     except TelegramError as exc:
         await update.message.reply_text(f"⚠️ Unlock করতে ব্যর্থ: {exc}")
 
@@ -1964,17 +1996,114 @@ async def cmd_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ══════════════════════════════════════════════
+# Background jobs (post_init থেকে শুরু হয়)
+# ══════════════════════════════════════════════
+
+async def captcha_timeout_job(app: Application):
+    """প্রতি ৩০ সেকেন্ডে captcha timeout চেক করে kick করে।"""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            expired = captcha_module.get_expired_captchas()
+            for gid, uid, data in expired:
+                captcha_module.remove_captcha(gid, uid)
+                try:
+                    await app.bot.ban_chat_member(gid, uid)
+                    await app.bot.unban_chat_member(gid, uid)
+                    # Captcha message delete
+                    try:
+                        await app.bot.delete_message(gid, data["msg_id"])
+                    except TelegramError:
+                        pass
+                    await app.bot.send_message(
+                        gid,
+                        f"⏰ Captcha সময় শেষ — <b>{data['name']}</b> কে kick করা হয়েছে।",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    logger.info("Captcha kick: group=%s user=%s", gid, uid)
+                except TelegramError as exc:
+                    logger.warning("Captcha kick failed: %s", exc)
+        except Exception as exc:
+            logger.error("Captcha timeout job error: %s", exc)
+
+async def warning_expiry_job(app: Application):
+    """প্রতিদিন একবার সব গ্রুপের পুরনো warning expire করে।"""
+    while True:
+        await asyncio.sleep(24 * 3600)  # ২৪ ঘণ্টা পর পর
+        try:
+            groups = database.get_group_list()
+            for g in groups:
+                gid = int(g["id"])
+                features = database.get_features(gid)
+                if not features.get("warn_expire", True):
+                    continue
+                # এই গ্রুপের সব user এর warning check করো
+                try:
+                    warnings_data = database._ref(f"/groups/{gid}/warnings").get() or {}
+                    for uid_str in warnings_data.keys():
+                        try:
+                            spam_filter.apply_warning_expiry(gid, int(uid_str), database)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    logger.debug("Expiry job group %s failed: %s", gid, exc)
+            logger.info("Warning expiry job completed for %d groups", len(groups))
+        except Exception as exc:
+            logger.error("Warning expiry job error: %s", exc)
+
+
+async def _on_startup(app: Application) -> None:
+    """Polling শুরুর ঠিক আগে — চলমান event loop-এর ভেতরে।"""
+    tasks = [
+        asyncio.create_task(health_check_server(), name="health"),
+        asyncio.create_task(captcha_timeout_job(app), name="captcha"),
+        asyncio.create_task(warning_expiry_job(app), name="warn_expiry"),
+        asyncio.create_task(scheduler.run_scheduler(app.bot), name="scheduler"),
+    ]
+    app.bot_data["_bg_jobs"] = tasks
+    for t in tasks:
+        t.add_done_callback(_log_job_exit)
+
+
+def _log_job_exit(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error("Background job %s crashed: %r", task.get_name(), exc)
+
+
+async def _on_shutdown(app: Application) -> None:
+    for t in app.bot_data.get("_bg_jobs", []):
+        t.cancel()
+    await asyncio.gather(*app.bot_data.get("_bg_jobs", []), return_exceptions=True)
+
+
+# ══════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════
 
-async def main() -> None:
+def main() -> None:
+    """
+    sync entry point — app.run_polling() নিজেই event loop বানায় ও signal সামলায়।
+    (আগে async main()-এর ভেতর asyncio.gather-এ run_polling ছিল; PTB 21.x-এ সেটা
+    চলমান loop-এর ভেতর থেকে চালানো যায় না, তাই বট শুরুতেই থেমে যেত।)
+    Background কাজ (health server, captcha, warning expiry, scheduler) চলে
+    post_init hook থেকে, আর post_shutdown-এ বন্ধ হয়।
+    """
     if not database.init():
         logger.critical("Firebase init failed — exiting.")
         return
 
     config.validate()
 
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(_on_startup)
+        .post_shutdown(_on_shutdown)
+        .build()
+    )
 
     # Owner commands
     app.add_handler(CommandHandler("stats", cmd_stats))
@@ -2046,70 +2175,12 @@ async def main() -> None:
         handle_message,
     ))
 
-    async def captcha_timeout_job():
-        """প্রতি ৩০ সেকেন্ডে captcha timeout চেক করে kick করে।"""
-        while True:
-            await asyncio.sleep(30)
-            try:
-                expired = captcha_module.get_expired_captchas()
-                for gid, uid, data in expired:
-                    captcha_module.remove_captcha(gid, uid)
-                    try:
-                        await app.bot.ban_chat_member(gid, uid)
-                        await app.bot.unban_chat_member(gid, uid)
-                        # Captcha message delete
-                        try:
-                            await app.bot.delete_message(gid, data["msg_id"])
-                        except TelegramError:
-                            pass
-                        await app.bot.send_message(
-                            gid,
-                            f"⏰ Captcha সময় শেষ — <b>{data['name']}</b> কে kick করা হয়েছে।",
-                            parse_mode=ParseMode.HTML,
-                        )
-                        logger.info("Captcha kick: group=%s user=%s", gid, uid)
-                    except TelegramError as exc:
-                        logger.warning("Captcha kick failed: %s", exc)
-            except Exception as exc:
-                logger.error("Captcha timeout job error: %s", exc)
-
-    async def warning_expiry_job():
-        """প্রতিদিন একবার সব গ্রুপের পুরনো warning expire করে।"""
-        while True:
-            await asyncio.sleep(24 * 3600)  # ২৪ ঘণ্টা পর পর
-            try:
-                groups = database.get_group_list()
-                for g in groups:
-                    gid = int(g["id"])
-                    features = database.get_features(gid)
-                    if not features.get("warn_expire", True):
-                        continue
-                    # এই গ্রুপের সব user এর warning check করো
-                    try:
-                        warnings_data = database._ref(f"/groups/{gid}/warnings").get() or {}
-                        for uid_str in warnings_data.keys():
-                            try:
-                                spam_filter.apply_warning_expiry(gid, int(uid_str), database)
-                            except Exception:
-                                pass
-                    except Exception as exc:
-                        logger.debug("Expiry job group %s failed: %s", gid, exc)
-                logger.info("Warning expiry job completed for %d groups", len(groups))
-            except Exception as exc:
-                logger.error("Warning expiry job error: %s", exc)
-
-    await asyncio.gather(
-        health_check_server(),
-        captcha_timeout_job(),
-        warning_expiry_job(),
-        scheduler.run_scheduler(app.bot),
-        app.run_polling(
-            allowed_updates=["message", "chat_member", "callback_query"],
-            drop_pending_updates=True,
-        ),
+    logger.info("Bot starting — polling...")
+    app.run_polling(
+        allowed_updates=["message", "chat_member", "callback_query"],
+        drop_pending_updates=True,
     )
 
 
 if __name__ == "__main__":
-    logger.info("Bot starting — polling...")
-    asyncio.run(main())
+    main()

@@ -460,6 +460,24 @@ def get_group_list() -> list[dict]:
         return []
 
 
+def get_trusted_list(group_id: int) -> list[int]:
+    """Trusted user-দের list ফেরত দেয়।"""
+    try:
+        data = _ref(f"/groups/{group_id}/trusted").get() or {}
+        return [int(uid) for uid, val in data.items() if val]
+    except Exception:
+        return []
+
+
+def get_vip_list(group_id: int) -> list[int]:
+    """VIP user-দের list ফেরত দেয়।"""
+    try:
+        data = _ref(f"/groups/{group_id}/vip").get() or {}
+        return [int(uid) for uid, val in data.items() if val]
+    except Exception:
+        return []
+
+
 def add_global_ban(user_id: int, reason: str = "") -> None:
     """সব গ্রুপে এই user-কে ban করার জন্য global blacklist-এ যোগ করে।"""
     _ref(f"/global_bans/{user_id}").set({"reason": reason, "ts": int(time.time())})

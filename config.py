@@ -166,6 +166,11 @@ def validate() -> list[str]:
             "Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_PATH."
         )
 
+    if BOT_OWNER_ID == 0:
+        logger.warning(
+            "BOT_OWNER_ID সেট করা নেই — Owner Panel ও owner কমান্ড কেউ ব্যবহার করতে পারবে না।"
+        )
+
     if not SIGHTENGINE_AVAILABLE:
         logger.warning(
             "Sightengine credentials not set "

@@ -30,6 +30,16 @@ services:
         sync: false
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false     # Paste full JSON as one line, no newlines
+      - key: BOT_OWNER_ID
+        sync: false     # Owner-এর Telegram numeric user ID (কোডে কোনো ID নেই)
+      - key: GEMINI_API_KEY
+        sync: false     # AI text moderation
+      - key: GEMINI_MODEL
+        sync: false     # চালু Gemini model-এর নাম (ai.google.dev থেকে দেখে নিন)
+      - key: GROQ_API_KEY
+        sync: false     # Fallback #1 + ভয়েস মেসেজ যাচাই
+      - key: TOGETHER_API_KEY
+        sync: false     # Fallback #2
       - key: SIGHTENGINE_API_USER
         sync: false     # Optional — media moderation degrades without this
       - key: SIGHTENGINE_API_SECRET

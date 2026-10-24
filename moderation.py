@@ -356,11 +356,14 @@ def moderate_text(text: str) -> ModerationResult:
     return ALLOW
 
 
-# ──────────────────────────────────────────────
-# Gemini AI Text Moderation
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# AI Text Moderation — Fallback Chain
+# Gemini (primary) → Groq (fallback 1) → Together AI (fallback 2)
+# ══════════════════════════════════════════════
 
-_GEMINI_PROMPT_TEMPLATE = """\
+# ── Shared prompt ─────────────────────────────
+
+_AI_MODERATION_PROMPT = """\
 তুমি একটি Telegram গ্রুপের content moderator। নিচের মেসেজটি বিশ্লেষণ করো।
 
 মেসেজ:
@@ -373,126 +376,290 @@ _GEMINI_PROMPT_TEMPLATE = """\
 2. যৌন উত্তেজনা বা flirting (যেমন "তুমি হট", "সেক্স করবা")
 3. গালিগালাজ বা অপমানজনক ভাষা
 4. হয়রানি বা ভয় দেখানো
+5. স্ক্যাম বা প্রতারণা (বিকাশ/নগদ/ফ্রি টাকা/লটারি)
 
 শুধুমাত্র নিচের JSON format-এ উত্তর দাও, অন্য কিছু লিখবে না:
-{{"is_violation": true/false, "category": "sexual/abusive/harassment/none", "reason": "সংক্ষিপ্ত কারণ বাংলায়", "score": 0.0}}
+{{"is_violation": true/false, "category": "sexual/abusive/harassment/scam/none", "reason": "সংক্ষিপ্ত কারণ বাংলায়", "score": 0.0}}
 
 score হবে 0.0 থেকে 1.0 এর মধ্যে (1.0 = নিশ্চিতভাবে লঙ্ঘন)।
-সাধারণ কথাবার্তা, প্রশ্ন, বা নিরীহ মেসেজের জন্য is_violation: false দাও।
+সাধারণ কথাবার্তা বা নিরীহ মেসেজের জন্য is_violation: false দাও।
 """
 
-_GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+def _parse_ai_json(raw: str) -> Optional[dict]:
+    """AI response থেকে JSON parse করে।"""
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # partial match চেষ্টা
+        import re
+        m = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except Exception:
+                pass
+    return None
+
+
+# ── Gemini ────────────────────────────────────
+
+_GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta"
+    "/models/{model}:generateContent"
+)
 
 
 async def _call_gemini(text: str) -> Optional[dict]:
-    """
-    Gemini API-তে POST করে JSON response ফেরত দেয়।
-    ব্যর্থ হলে None ফেরত দেয়।
-    """
-    url = _GEMINI_API_URL.format(model=config.GEMINI_MODEL)
-    prompt = _GEMINI_PROMPT_TEMPLATE.format(text=text[:1500])  # max 1500 char
+    """Gemini API call। ব্যর্থ হলে None।"""
+    if not config.GEMINI_AVAILABLE:
+        return None
 
+    url = _GEMINI_API_URL.format(model=config.GEMINI_MODEL)
+    prompt = _AI_MODERATION_PROMPT.format(text=text[:1500])
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,       # কম temperature = consistent output
-            "maxOutputTokens": 150,   # শুধু JSON দরকার
-        },
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 150},
     }
-
-    params = {"key": config.GEMINI_API_KEY}
-
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10)
         ) as session:
-            async with session.post(url, json=payload, params=params) as resp:
+            async with session.post(
+                url, json=payload, params={"key": config.GEMINI_API_KEY}
+            ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.warning("Gemini API HTTP %s: %s", resp.status, body[:200])
+                    logger.warning("Gemini HTTP %s: %s", resp.status, body[:150])
                     return None
                 data = await resp.json()
 
-        # Gemini response থেকে text বের করা
-        candidates = data.get("candidates", [])
-        if not candidates:
-            logger.warning("Gemini: কোনো candidate নেই")
-            return None
-
-        content = candidates[0].get("content", {})
-        parts = content.get("parts", [])
+        parts = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [])
+        )
         if not parts:
             return None
-
-        raw_text = parts[0].get("text", "").strip()
-
-        # JSON parse — markdown fence সরিয়ে
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw_text)
+        return _parse_ai_json(parts[0].get("text", ""))
 
     except asyncio.TimeoutError:
-        logger.warning("Gemini: request timeout (>10s)")
-        return None
-    except json.JSONDecodeError as exc:
-        logger.warning("Gemini: JSON parse error: %s", exc)
+        logger.warning("Gemini: timeout")
         return None
     except Exception as exc:
-        logger.error("Gemini: unexpected error: %s", exc)
+        logger.warning("Gemini: %s", exc)
         return None
 
+
+# ── Groq ──────────────────────────────────────
+
+_GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+async def _call_groq(text: str) -> Optional[dict]:
+    """Groq API call (OpenAI-compatible)। ব্যর্থ হলে None।"""
+    if not config.GROQ_AVAILABLE:
+        return None
+
+    prompt = _AI_MODERATION_PROMPT.format(text=text[:1500])
+    payload = {
+        "model": config.GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 150,
+    }
+    headers = {
+        "Authorization": f"Bearer {config.GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as session:
+            async with session.post(
+                _GROQ_API_URL, json=payload, headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Groq HTTP %s: %s", resp.status, body[:150])
+                    return None
+                data = await resp.json()
+
+        raw = data["choices"][0]["message"]["content"]
+        return _parse_ai_json(raw)
+
+    except asyncio.TimeoutError:
+        logger.warning("Groq: timeout")
+        return None
+    except Exception as exc:
+        logger.warning("Groq: %s", exc)
+        return None
+
+
+# ── Together AI ───────────────────────────────
+
+_TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
+
+
+async def _call_together(text: str) -> Optional[dict]:
+    """Together AI API call। ব্যর্থ হলে None।"""
+    if not config.TOGETHER_AVAILABLE:
+        return None
+
+    prompt = _AI_MODERATION_PROMPT.format(text=text[:1500])
+    payload = {
+        "model": config.TOGETHER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 150,
+    }
+    headers = {
+        "Authorization": f"Bearer {config.TOGETHER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=12)
+        ) as session:
+            async with session.post(
+                _TOGETHER_API_URL, json=payload, headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Together HTTP %s: %s", resp.status, body[:150])
+                    return None
+                data = await resp.json()
+
+        raw = data["choices"][0]["message"]["content"]
+        return _parse_ai_json(raw)
+
+    except asyncio.TimeoutError:
+        logger.warning("Together: timeout")
+        return None
+    except Exception as exc:
+        logger.warning("Together: %s", exc)
+        return None
+
+
+# ── Scam detection (regex, বাংলা) ─────────────
+
+_SCAM_PATTERNS = [
+    re.compile(
+        r"(বিকাশ|নগদ|রকেট).{0,20}(পাঠান|দিন|করুন|নম্বর|একাউন্ট)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(ফ্রি|free).{0,15}(টাকা|taka|bdt|পয়েন্ট)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(লটারি|lottery|jackpot|জ্যাকপট).{0,20}(জিত|win|পেয়েছেন)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(invest|বিনিয়োগ).{0,20}(profit|মুনাফা|return).{0,10}%",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(click|ক্লিক).{0,20}(link|লিংক).{0,20}(earn|আয়|টাকা)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(০১[3-9]\d{8}|01[3-9]\d{8}).{0,20}(বিকাশ|নগদ|পাঠান)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _is_scam(text: str) -> bool:
+    """Regex দিয়ে scam/প্রতারণামূলক মেসেজ ধরে।"""
+    for pat in _SCAM_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+
+# ── Main async moderation ──────────────────────
 
 async def moderate_text_async(text: str) -> ModerationResult:
     """
-    Smart hybrid text moderation:
+    Smart hybrid text moderation — ৪ স্তর:
 
-    ধাপ ১ — Regex (sync, fast):
-        স্পষ্ট গালি/অশ্লীল শব্দ থাকলে সাথে সাথে BLOCK।
-        Gemini API call হয় না — cost শূন্য।
-
-    ধাপ ২ — Gemini AI (async, smart):
-        Regex কিছু না ধরলে Gemini দিয়ে চেক।
-        "তুমি হট", "সেক্স করবা", যেভাবেই লিখুক — context বুঝবে।
-        Gemini unavailable বা error হলে ALLOW (fail open — text-এর জন্য safe)।
-
-    bot.py-তে message_handler()-এ এই ফাংশন ব্যবহার করুন।
+    ধাপ ১ — Regex:        স্পষ্ট গালি/অশ্লীল → সাথে সাথে BLOCK
+    ধাপ ২ — Scam Regex:   বিকাশ স্ক্যাম/ফ্রি টাকা → BLOCK
+    ধাপ ৩ — Gemini:       primary AI (fail → Groq)
+    ধাপ ৪ — Groq:         fallback #1 (fail → Together)
+    ধাপ ৫ — Together AI:  fallback #2 (fail → ALLOW)
     """
-    if not text:
+    if not text or len(text.strip()) < 3:
         return ALLOW
 
-    # ── ধাপ ১: Regex চেক ──────────────────────────────────────────────────
+    # ── ধাপ ১: Regex ──────────────────────────
     regex_result = moderate_text(text)
     if regex_result.is_violation:
         return regex_result
 
-    # ── ধাপ ২: Gemini AI চেক ─────────────────────────────────────────────
-    if not config.GEMINI_AVAILABLE:
-        return ALLOW  # Gemini না থাকলে regex result-ই চূড়ান্ত
+    # ── ধাপ ২: Scam detect ────────────────────
+    if _is_scam(text):
+        return ModerationResult(
+            Verdict.BLOCK,
+            reason="🚨 সম্ভাব্য স্ক্যাম বা প্রতারণামূলক মেসেজ",
+            details={"tier": "scam_regex"},
+        )
 
-    # খুব ছোট মেসেজ (১-২ শব্দ) Gemini-তে না পাঠানো — false positive এড়াতে
+    # ── ধাপ ৩–৫: AI chain ─────────────────────
+    any_ai = (
+        config.GEMINI_AVAILABLE
+        or config.GROQ_AVAILABLE
+        or config.TOGETHER_AVAILABLE
+    )
+    if not any_ai:
+        return ALLOW
+
     if len(text.strip()) < 5:
         return ALLOW
 
-    gemini_data = await _call_gemini(text)
+    # Gemini → Groq → Together (প্রথমটা সফল হলে পরেরটা চলে না)
+    ai_data: Optional[dict] = None
+    ai_source = "none"
 
-    if gemini_data is None:
-        # API error — fail open (text moderate না হওয়া media-র চেয়ে কম ঝুঁকির)
-        logger.info("Gemini unavailable — text '%s...' allowed by default", text[:30])
+    ai_data = await _call_gemini(text)
+    if ai_data is not None:
+        ai_source = "gemini"
+    else:
+        logger.info("Gemini unavailable — trying Groq")
+        ai_data = await _call_groq(text)
+        if ai_data is not None:
+            ai_source = "groq"
+        else:
+            logger.info("Groq unavailable — trying Together AI")
+            ai_data = await _call_together(text)
+            if ai_data is not None:
+                ai_source = "together"
+
+    if ai_data is None:
+        logger.info("সব AI unavailable — '%s...' allowed", text[:30])
         return ALLOW
 
-    is_violation = gemini_data.get("is_violation", False)
-    score = float(gemini_data.get("score", 0.0))
-    category = gemini_data.get("category", "none")
-    reason = gemini_data.get("reason", "অনুপযুক্ত কন্টেন্ট")
+    is_violation = ai_data.get("is_violation", False)
+    score = float(ai_data.get("score", 0.0))
+    category = ai_data.get("category", "none")
+    reason = ai_data.get("reason", "অনুপযুক্ত কন্টেন্ট")
 
     if is_violation and score >= config.GEMINI_BLOCK_THRESHOLD:
         logger.info(
-            "Gemini blocked text (score=%.2f, category=%s): '%s...'",
-            score, category, text[:40],
+            "[%s] blocked (score=%.2f, cat=%s): '%s...'",
+            ai_source, score, category, text[:40],
         )
         return ModerationResult(
             Verdict.BLOCK,
-            reason=f"AI মডারেশন: {reason}",
-            details={"gemini_score": score, "category": category, "tier": "gemini"},
+            reason=f"AI মডারেশন ({ai_source}): {reason}",
+            details={
+                "score": score,
+                "category": category,
+                "tier": ai_source,
+            },
         )
 
     return ALLOW

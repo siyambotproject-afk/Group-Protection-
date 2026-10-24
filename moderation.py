@@ -480,17 +480,25 @@ async def _call_gemini(text: str) -> Optional[dict]:
         },
     }
     try:
+        data = None
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10)
         ) as session:
-            async with session.post(
-                url, json=payload, params={"key": config.GEMINI_API_KEY}
-            ) as resp:
-                if resp.status != 200:
+            # 429/500/503 সাময়িক (যেমন "high demand") — ২ বার আবার চেষ্টা
+            for attempt in range(3):
+                async with session.post(
+                    url, json=payload, params={"key": config.GEMINI_API_KEY}
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        break
                     body = await resp.text()
                     logger.warning("Gemini HTTP %s: %s", resp.status, body[:150])
-                    return None
-                data = await resp.json()
+                    if resp.status not in (429, 500, 503) or attempt == 2:
+                        return None
+                await asyncio.sleep(1.0 * (attempt + 1))
+        if data is None:
+            return None
 
         parts = (
             data.get("candidates", [{}])[0]
@@ -524,7 +532,8 @@ async def _call_groq(text: str) -> Optional[dict]:
         "model": config.GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "max_tokens": 150,
+        # gpt-oss ইত্যাদি reasoning model উত্তরের আগে token খরচ করে; 150 হলে কেটে যায়
+        "max_tokens": 1024,
     }
     headers = {
         "Authorization": f"Bearer {config.GROQ_API_KEY}",

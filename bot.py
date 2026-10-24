@@ -2098,7 +2098,11 @@ def main() -> None:
         logger.critical("Firebase init failed — exiting.")
         return
 
-    config.validate()
+    config_errors = config.validate()
+    if config_errors:
+        for err in config_errors:
+            logger.critical("Config error: %s", err)
+        return
 
     app = (
         Application.builder()
